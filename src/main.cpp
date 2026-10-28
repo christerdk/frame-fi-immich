@@ -167,6 +167,11 @@ const long reconnectInterval = 5000; // Interval to wait between retries (5 seco
 #define STORAGE_SCAN_DELAY_MS 30000
 #endif
 bool isStorageScanDone = false;
+// --- Keep Wi-Fi off until the frame is showing pictures; joining Wi-Fi disturbs the frame's USB setup ---
+const unsigned long wifiAfterPictureDelay = 2000; // Time after the frame's first picture read before joining Wi-Fi (2 seconds)
+const unsigned long wifiStartTimeout = 20000;     // Time after boot to join Wi-Fi even if no picture was read (20 seconds)
+volatile unsigned long firstJpegReadTime = 0;
+bool isNetworkStarted = false;
 // --- Re-announce the drive once if the frame has not read any pictures after boot ---
 const unsigned long usbCheckDelay = 10000;        // Time after boot to check that the host has set up USB (10 seconds; a good boot is set up and reading by 6.8 s)
 const unsigned long reannounceCheckDelay = 20000; // Time after boot to check for picture reads (20 seconds; the frame's first picture read was seen at 9.4 s)
@@ -222,6 +227,7 @@ void displayBootScreen();
 void setupFilesystems();
 void setupWebServer();
 void startInitialMode();
+void startNetwork();
 void handleButton();
 void handleMqtt();
 void handleFtp();
@@ -315,6 +321,15 @@ void setup() {
 
   // --- Start in initial mode immediately so USB host detects storage without waiting for WiFi ---
   startInitialMode();
+
+  // --- WiFi is started from loop() once the frame reads pictures, see wifiAfterPictureDelay ---
+}
+
+/**
+ * @brief Connects to WiFi and starts the web server and MQTT.
+ */
+void startNetwork() {
+  isNetworkStarted = true;
 
   // --- Connect to WiFi and configure services ---
   logTimeline("wifi_start");
@@ -476,6 +491,9 @@ void startInitialMode() {
     // --- Turn the LED on ---
     leds[0] = CRGB::Green;
     FastLED.show();
+    // --- Index before the medium is present, so onRead can spot picture reads from the start ---
+    buildJpegIndex();
+    logTimelineValue("jpeg_files", jpegFiles.size());
     // --- USB is already running since setup(); this reports the medium as present ---
     mscInit();
     logTimeline("msc_ready");
@@ -494,6 +512,15 @@ void startInitialMode() {
  * @brief Main loop that runs repeatedly.
  */
 void loop() {
+  // --- Join Wi-Fi once the frame shows pictures, or after a timeout without a frame ---
+  if (!isNetworkStarted) {
+    unsigned long jpegReadTime = firstJpegReadTime;
+    bool isFrameShowingPictures = jpegReadTime > 0 && millis() - jpegReadTime >= wifiAfterPictureDelay;
+    if (isFrameShowingPictures || millis() >= wifiStartTimeout) {
+      startNetwork();
+    }
+  }
+
   // --- Show real storage info once the USB host has had time to read the card ---
   if (!isStorageScanDone && millis() >= STORAGE_SCAN_DELAY_MS) {
     isStorageScanDone = true;
@@ -820,6 +847,11 @@ static int32_t onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufs
     mscReadLog[mscReadLogCount] = {millis(), lba, count};
     mscReadLogCount++;
   }
+  // --- The index is only rebuilt while the medium is absent, so reading it here is safe ---
+  if (firstJpegReadTime == 0 && findJpegRead(lba, count) >= 0) {
+    firstJpegReadTime = millis();
+    logTimeline("first_jpeg_read");
+  }
   return bufsize;
 }
 
@@ -877,8 +909,6 @@ void handleReannounce() {
       reannounceState = REANNOUNCE_DONE;
       return;
     }
-    // --- Built here so /debug/msc can name picture reads after an early reconnect too ---
-    buildJpegIndex();
     isUsbMountedAtCheck = tud_mounted();
     logTimeline(isUsbMountedAtCheck ? "usb_check_mounted" : "usb_check_not_mounted");
     HWSerial.printf("USB mounted at check: %d (%u reads)\n", isUsbMountedAtCheck, mscTotalReads);
@@ -1268,6 +1298,8 @@ void enterMscMode() {
   // --- Initialize USB MSC ---
   if (card) {
     // --- The USB event handler is registered once in setup(); registering it again would double every event ---
+    // --- Re-index while the medium is still absent, so uploaded pictures are recognised ---
+    buildJpegIndex();
     mscInit();
     logTimeline("mode_msc");
     USBSerial.begin();
