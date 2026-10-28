@@ -25,6 +25,7 @@
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "diskio_sdmmc.h"
+#include "tusb.h"
 #include <vector>
 #include <algorithm>
 #include <dirent.h>
@@ -162,12 +163,21 @@ const long reconnectInterval = 5000; // Interval to wait between retries (5 seco
 #endif
 bool isStorageScanDone = false;
 // --- Re-announce the drive once if the frame has not read any pictures after boot ---
-const unsigned long reannounceCheckDelay = 10000; // Time after boot to check for picture reads (10 seconds)
-const unsigned long reannounceOffTime = 3000;     // Time the drive reports no medium during a re-announce (3 seconds)
+const unsigned long reannounceCheckDelay = 20000; // Time after boot to check for picture reads (20 seconds; the frame's first picture read was seen at 9.4 s)
+const unsigned long reannounceOffTime = 3000;     // Time the drive or USB device is away during a re-announce (3 seconds)
 enum ReannounceState { REANNOUNCE_WAITING, REANNOUNCE_OFF, REANNOUNCE_DONE };
 ReannounceState reannounceState = REANNOUNCE_WAITING;
 unsigned long reannounceStartTime = 0;
 int jpegReadsAtCheck = -1;
+// --- "usb": no reads at all, so the USB device is disconnected; "medium": reads but no pictures ---
+const char* reannounceType = "none";
+bool isUsbMountedAtCheck = false;
+
+// --- USB event counts for boot diagnostics ---
+volatile uint32_t usbStartedEvents = 0;
+volatile uint32_t usbStoppedEvents = 0;
+volatile uint32_t usbSuspendEvents = 0;
+volatile uint32_t usbResumeEvents = 0;
 
 // --- Log of MSC reads, used to tell picture reads from filesystem reads ---
 struct MscRead {
@@ -179,7 +189,12 @@ const int MSC_READ_LOG_SIZE = 1024;
 MscRead mscReadLog[MSC_READ_LOG_SIZE];
 volatile int mscReadLogCount = 0;
 volatile uint32_t mscTotalReads = 0;
-std::vector<uint32_t> jpegStartSectors; // First sector of every JPEG file, sorted
+struct JpegFile {
+  uint32_t sector; // First sector of the file
+  String name;     // Path, kept for the first MAX_NAMED_JPEG_FILES files only to save RAM
+};
+const int MAX_NAMED_JPEG_FILES = 300;
+std::vector<JpegFile> jpegFiles; // Sorted by sector
 
 // --- Function prototypes ---
 void initializeConfigs();
@@ -232,7 +247,7 @@ void handleReannounce();
 void buildJpegIndex();
 void addJpegStartSectors(char* path, size_t pathSize, int depth);
 bool isJpegName(const char* name);
-bool isJpegRead(uint32_t lba, uint32_t count);
+int findJpegRead(uint32_t lba, uint32_t count);
 int countJpegReads(unsigned long fromMs);
 void handleMscDebug();
 void drawHeader(const char* title, uint16_t bannerColor);
@@ -794,10 +809,10 @@ static void usbEventCallback(void *arg, esp_event_base_t event_base, int32_t eve
   if (event_base == ARDUINO_USB_EVENTS) {
     arduino_usb_event_data_t *data = (arduino_usb_event_data_t *)event_data;
     switch (event_id) {
-    case ARDUINO_USB_STARTED_EVENT: HWSerial.println("USB PLUGGED"); break; 
-    case ARDUINO_USB_STOPPED_EVENT: HWSerial.println("USB UNPLUGGED"); break; 
-    case ARDUINO_USB_SUSPEND_EVENT: HWSerial.printf("USB SUSPENDED: remote_wakeup_en: %u\n", data->suspend.remote_wakeup_en); break;
-    case ARDUINO_USB_RESUME_EVENT: HWSerial.println("USB RESUMED"); break;
+    case ARDUINO_USB_STARTED_EVENT: usbStartedEvents++; HWSerial.println("USB PLUGGED"); break;
+    case ARDUINO_USB_STOPPED_EVENT: usbStoppedEvents++; HWSerial.println("USB UNPLUGGED"); break;
+    case ARDUINO_USB_SUSPEND_EVENT: usbSuspendEvents++; HWSerial.printf("USB SUSPENDED: remote_wakeup_en: %u\n", data->suspend.remote_wakeup_en); break;
+    case ARDUINO_USB_RESUME_EVENT: usbResumeEvents++; HWSerial.println("USB RESUMED"); break;
     default: break;
     }
   }
@@ -830,21 +845,34 @@ void handleReannounce() {
     }
     buildJpegIndex();
     jpegReadsAtCheck = countJpegReads(0);
-    HWSerial.printf("Picture reads after boot: %d (of %u reads, %u JPEG files)\n", jpegReadsAtCheck, mscTotalReads, jpegStartSectors.size());
-    if (jpegReadsAtCheck > 0) {
+    isUsbMountedAtCheck = tud_mounted();
+    HWSerial.printf("Picture reads after boot: %d (of %u reads, %u JPEG files, USB mounted: %d)\n", jpegReadsAtCheck, mscTotalReads, jpegFiles.size(), isUsbMountedAtCheck);
+    // --- A full log means the host is busy reading, even if the picture reads fell outside it ---
+    if (jpegReadsAtCheck > 0 || mscReadLogCount >= MSC_READ_LOG_SIZE) {
       reannounceState = REANNOUNCE_DONE;
       return;
     }
 
-    // --- Same as a mode switch seen from the host: the medium disappears and comes back ---
-    HWSerial.println("No picture reads, re-announcing USB drive.");
-    MSC.end();
+    if (mscTotalReads == 0) {
+      // --- The host never got as far as the drive, so make it detect the USB device again, like a replug ---
+      HWSerial.println("No reads at all, reconnecting USB device.");
+      reannounceType = "usb";
+      tud_disconnect();
+    } else {
+      // --- Same as a mode switch seen from the host: the medium disappears and comes back ---
+      HWSerial.println("No picture reads, re-announcing USB drive.");
+      reannounceType = "medium";
+      MSC.end();
+    }
     reannounceStartTime = now;
     reannounceState = REANNOUNCE_OFF;
   } else if (reannounceState == REANNOUNCE_OFF && now - reannounceStartTime >= reannounceOffTime) {
     reannounceState = REANNOUNCE_DONE;
-    // --- A mode switch during the off time has already taken over the drive ---
-    if (isInMscMode) {
+    if (strcmp(reannounceType, "usb") == 0) {
+      tud_connect();
+      HWSerial.println("USB device reconnected.");
+    } else if (isInMscMode) {
+      // --- Skipped if a mode switch during the off time has already taken over the drive ---
       mscInit();
       HWSerial.println("USB drive re-announced.");
     }
@@ -857,9 +885,9 @@ void handleReannounce() {
 void buildJpegIndex() {
   char path[300];
   snprintf(path, sizeof(path), "%u:", ff_diskio_get_pdrv_card(card));
-  jpegStartSectors.clear();
+  jpegFiles.clear();
   addJpegStartSectors(path, sizeof(path), 0);
-  std::sort(jpegStartSectors.begin(), jpegStartSectors.end());
+  std::sort(jpegFiles.begin(), jpegFiles.end(), [](const JpegFile& a, const JpegFile& b) { return a.sector < b.sector; });
 }
 
 /**
@@ -886,7 +914,10 @@ void addJpegStartSectors(char* path, size_t pathSize, int depth) {
     } else if (isJpegName(info.fname) && f_open(&file, path, FA_READ) == FR_OK) {
       if (file.obj.sclust >= 2) {
         FATFS* fs = file.obj.fs;
-        jpegStartSectors.push_back(fs->database + (file.obj.sclust - 2) * fs->csize);
+        uint32_t sector = fs->database + (file.obj.sclust - 2) * fs->csize;
+        // --- Store the path without the drive prefix ---
+        String name = jpegFiles.size() < MAX_NAMED_JPEG_FILES ? String(strchr(path, ':') + 1) : String();
+        jpegFiles.push_back({sector, name});
       }
       f_close(&file);
     }
@@ -904,11 +935,14 @@ bool isJpegName(const char* name) {
 }
 
 /**
- * @brief Checks whether a read covers the first sector of a JPEG file.
+ * @brief Finds the JPEG file whose first sector a read covers, or returns -1.
  */
-bool isJpegRead(uint32_t lba, uint32_t count) {
-  auto it = std::lower_bound(jpegStartSectors.begin(), jpegStartSectors.end(), lba);
-  return it != jpegStartSectors.end() && *it < lba + count;
+int findJpegRead(uint32_t lba, uint32_t count) {
+  auto it = std::lower_bound(jpegFiles.begin(), jpegFiles.end(), lba, [](const JpegFile& file, uint32_t sector) { return file.sector < sector; });
+  if (it != jpegFiles.end() && it->sector < lba + count) {
+    return it - jpegFiles.begin();
+  }
+  return -1;
 }
 
 /**
@@ -918,7 +952,7 @@ int countJpegReads(unsigned long fromMs) {
   int jpegReads = 0;
   int logCount = mscReadLogCount;
   for (int i = 0; i < logCount; i++) {
-    if (mscReadLog[i].ms >= fromMs && isJpegRead(mscReadLog[i].lba, mscReadLog[i].count)) {
+    if (mscReadLog[i].ms >= fromMs && findJpegRead(mscReadLog[i].lba, mscReadLog[i].count) >= 0) {
       jpegReads++;
     }
   }
@@ -1267,35 +1301,48 @@ void handleMscDebug() {
   }
   const int MAX_LISTED_READS = 40;
   int logCount = mscReadLogCount;
-  int listed = min(logCount, MAX_LISTED_READS);
+  bool isReannounced = reannounceStartTime > 0;
 
-  DynamicJsonDocument jsonResponse(JSON_OBJECT_SIZE(12) + JSON_ARRAY_SIZE(MAX_LISTED_READS) + MAX_LISTED_READS * JSON_OBJECT_SIZE(4) + 256);
+  DynamicJsonDocument jsonResponse(8192);
   jsonResponse["uptime_ms"] = millis();
   jsonResponse["total_reads"] = mscTotalReads;
   jsonResponse["logged_reads"] = logCount;
-  jsonResponse["jpeg_files"] = jpegStartSectors.size();
+  jsonResponse["jpeg_files"] = jpegFiles.size();
   jsonResponse["jpeg_reads_at_check"] = jpegReadsAtCheck;
   jsonResponse["jpeg_reads_total"] = countJpegReads(0);
-  jsonResponse["reannounced"] = reannounceStartTime > 0;
+  jsonResponse["usb_mounted_at_check"] = isUsbMountedAtCheck;
+  jsonResponse["usb_mounted_now"] = tud_mounted();
+  JsonObject usbEvents = jsonResponse.createNestedObject("usb_events");
+  usbEvents["started"] = usbStartedEvents;
+  usbEvents["stopped"] = usbStoppedEvents;
+  usbEvents["suspend"] = usbSuspendEvents;
+  usbEvents["resume"] = usbResumeEvents;
+  jsonResponse["reannounced"] = isReannounced;
+  jsonResponse["reannounce_type"] = reannounceType;
   jsonResponse["reannounce_ms"] = reannounceStartTime;
-  jsonResponse["jpeg_reads_after_reannounce"] = reannounceStartTime > 0 ? countJpegReads(reannounceStartTime) : 0;
+  jsonResponse["jpeg_reads_after_reannounce"] = isReannounced ? countJpegReads(reannounceStartTime) : 0;
   jsonResponse["first_read_ms"] = logCount > 0 ? mscReadLog[0].ms : 0;
+
+  long firstReadAfterReannounceMs = -1;
   long firstJpegReadMs = -1;
+  JsonArray jpegReads = jsonResponse.createNestedArray("jpeg_reads");
   for (int i = 0; i < logCount; i++) {
-    if (isJpegRead(mscReadLog[i].lba, mscReadLog[i].count)) {
+    if (isReannounced && firstReadAfterReannounceMs < 0 && mscReadLog[i].ms >= reannounceStartTime) {
+      firstReadAfterReannounceMs = mscReadLog[i].ms;
+    }
+    int fileIndex = findJpegRead(mscReadLog[i].lba, mscReadLog[i].count);
+    if (fileIndex < 0) continue;
+    if (firstJpegReadMs < 0) {
       firstJpegReadMs = mscReadLog[i].ms;
-      break;
+    }
+    if (jpegReads.size() < MAX_LISTED_READS) {
+      JsonObject read = jpegReads.createNestedObject();
+      read["ms"] = mscReadLog[i].ms;
+      read["file"] = jpegFiles[fileIndex].name;
     }
   }
+  jsonResponse["first_read_after_reannounce_ms"] = firstReadAfterReannounceMs;
   jsonResponse["first_jpeg_read_ms"] = firstJpegReadMs;
-  JsonArray reads = jsonResponse.createNestedArray("reads");
-  for (int i = 0; i < listed; i++) {
-    JsonObject read = reads.createNestedObject();
-    read["ms"] = mscReadLog[i].ms;
-    read["lba"] = mscReadLog[i].lba;
-    read["count"] = mscReadLog[i].count;
-    read["jpeg"] = isJpegRead(mscReadLog[i].lba, mscReadLog[i].count);
-  }
 
   String output;
   serializeJson(jsonResponse, output);
