@@ -113,7 +113,12 @@ TFT_eSPI tft = TFT_eSPI();
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
+// --- UART0 is called Serial0 only when Serial is USB CDC ---
+#if ARDUINO_USB_CDC_ON_BOOT
 #define HWSerial    Serial0
+#else
+#define HWSerial    Serial
+#endif
 #define MOUNT_POINT "/sdcard"
  sdmmc_card_t *card;
 
@@ -163,7 +168,9 @@ const long reconnectInterval = 5000; // Interval to wait between retries (5 seco
 #endif
 bool isStorageScanDone = false;
 // --- Re-announce the drive once if the frame has not read any pictures after boot ---
+const unsigned long usbCheckDelay = 10000;        // Time after boot to check that the host has set up USB (10 seconds; a good boot is set up and reading by 6.8 s)
 const unsigned long reannounceCheckDelay = 20000; // Time after boot to check for picture reads (20 seconds; the frame's first picture read was seen at 9.4 s)
+bool isUsbChecked = false;
 const unsigned long reannounceOffTime = 3000;     // Time the drive or USB device is away during a re-announce (3 seconds)
 enum ReannounceState { REANNOUNCE_WAITING, REANNOUNCE_OFF, REANNOUNCE_DONE };
 ReannounceState reannounceState = REANNOUNCE_WAITING;
@@ -178,6 +185,16 @@ volatile uint32_t usbStartedEvents = 0;
 volatile uint32_t usbStoppedEvents = 0;
 volatile uint32_t usbSuspendEvents = 0;
 volatile uint32_t usbResumeEvents = 0;
+
+// --- Boot timeline for diagnostics: key = event, value = millis() unless logged with a value ---
+struct TimelineEntry {
+  const char* key;
+  uint32_t value;
+};
+const int TIMELINE_SIZE = 64;
+TimelineEntry timeline[TIMELINE_SIZE];
+volatile int timelineCount = 0;
+portMUX_TYPE timelineMux = portMUX_INITIALIZER_UNLOCKED;
 
 // --- Log of MSC reads, used to tell picture reads from filesystem reads ---
 struct MscRead {
@@ -250,6 +267,8 @@ bool isJpegName(const char* name);
 int findJpegRead(uint32_t lba, uint32_t count);
 int countJpegReads(unsigned long fromMs);
 void handleMscDebug();
+void logTimeline(const char* key);
+void logTimelineValue(const char* key, uint32_t value);
 void drawHeader(const char* title, uint16_t bannerColor);
 void drawStorageInfo(int files, int totalSizeMB, float freeSizeMB);
 void drawInfoScreen(const char* title, const char* message, const char* version, uint16_t headerColor);
@@ -277,19 +296,30 @@ const char* getLedColorString(CRGB color);
  * @brief Initializes the device and all its components.
  */
 void setup() {
+  logTimeline("setup_start");
+
+  // --- Take over USB as the drive first, so the host never sees the device change; the medium is reported once the SD card is ready ---
+  USB.onEvent(usbEventCallback);
+  USBSerial.begin();
+  USB.begin();
+  logTimeline("usb_begin");
+
   initializeConfigs();
   setupSerial();
   setupLed();
   setupButton();
   setupDisplay();
   displayBootScreen();
+  logTimeline("display_ready");
   loadConfig();
 
   // --- Start in initial mode immediately so USB host detects storage without waiting for WiFi ---
   startInitialMode();
 
   // --- Connect to WiFi and configure services ---
+  logTimeline("wifi_start");
   connectToWiFi();
+  logTimeline(WiFi.status() == WL_CONNECTED ? "wifi_connected" : "wifi_failed");
 
   if (shouldSaveConfig) {
     saveConfig();
@@ -442,13 +472,13 @@ void startInitialMode() {
   HWSerial.println("SD Card initialized for MSC.");
 
   if (card) {
+    logTimeline("sd_ready");
     // --- Turn the LED on ---
     leds[0] = CRGB::Green;
     FastLED.show();
-    USB.onEvent(usbEventCallback);
+    // --- USB is already running since setup(); this reports the medium as present ---
     mscInit();
-    USBSerial.begin();
-    USB.begin();
+    logTimeline("msc_ready");
     HWSerial.println("\n✅ Started in MSC mode. Connect USB to a computer.");
     isInMscMode = true;
     
@@ -782,6 +812,9 @@ static int32_t onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufs
   sdmmc_read_sectors(card, (uint8_t*)buffer + offset, lba, count);
 
   // --- Log the read so picture reads can be detected ---
+  if (mscTotalReads == 0) {
+    logTimeline("first_read");
+  }
   mscTotalReads++;
   if (mscReadLogCount < MSC_READ_LOG_SIZE) {
     mscReadLog[mscReadLogCount] = {millis(), lba, count};
@@ -809,10 +842,10 @@ static void usbEventCallback(void *arg, esp_event_base_t event_base, int32_t eve
   if (event_base == ARDUINO_USB_EVENTS) {
     arduino_usb_event_data_t *data = (arduino_usb_event_data_t *)event_data;
     switch (event_id) {
-    case ARDUINO_USB_STARTED_EVENT: usbStartedEvents++; HWSerial.println("USB PLUGGED"); break;
-    case ARDUINO_USB_STOPPED_EVENT: usbStoppedEvents++; HWSerial.println("USB UNPLUGGED"); break;
-    case ARDUINO_USB_SUSPEND_EVENT: usbSuspendEvents++; HWSerial.printf("USB SUSPENDED: remote_wakeup_en: %u\n", data->suspend.remote_wakeup_en); break;
-    case ARDUINO_USB_RESUME_EVENT: usbResumeEvents++; HWSerial.println("USB RESUMED"); break;
+    case ARDUINO_USB_STARTED_EVENT: usbStartedEvents++; logTimeline("usb_mounted"); HWSerial.println("USB PLUGGED"); break;
+    case ARDUINO_USB_STOPPED_EVENT: usbStoppedEvents++; logTimeline("usb_unmounted"); HWSerial.println("USB UNPLUGGED"); break;
+    case ARDUINO_USB_SUSPEND_EVENT: usbSuspendEvents++; logTimeline("usb_suspend"); HWSerial.printf("USB SUSPENDED: remote_wakeup_en: %u\n", data->suspend.remote_wakeup_en); break;
+    case ARDUINO_USB_RESUME_EVENT: usbResumeEvents++; logTimeline("usb_resume"); HWSerial.println("USB RESUMED"); break;
     default: break;
     }
   }
@@ -838,15 +871,34 @@ void mscInit(void) {
 void handleReannounce() {
   unsigned long now = millis();
 
-  if (reannounceState == REANNOUNCE_WAITING && now >= reannounceCheckDelay) {
+  if (reannounceState == REANNOUNCE_WAITING && !isUsbChecked && now >= usbCheckDelay) {
+    isUsbChecked = true;
     if (!isInMscMode || !card) {
       reannounceState = REANNOUNCE_DONE;
       return;
     }
+    // --- Built here so /debug/msc can name picture reads after an early reconnect too ---
     buildJpegIndex();
-    jpegReadsAtCheck = countJpegReads(0);
     isUsbMountedAtCheck = tud_mounted();
-    HWSerial.printf("Picture reads after boot: %d (of %u reads, %u JPEG files, USB mounted: %d)\n", jpegReadsAtCheck, mscTotalReads, jpegFiles.size(), isUsbMountedAtCheck);
+    logTimeline(isUsbMountedAtCheck ? "usb_check_mounted" : "usb_check_not_mounted");
+    HWSerial.printf("USB mounted at check: %d (%u reads)\n", isUsbMountedAtCheck, mscTotalReads);
+    if (!isUsbMountedAtCheck && mscTotalReads == 0) {
+      // --- The host gave up setting up the device, so make it detect the device again, like a replug ---
+      HWSerial.println("USB not set up, reconnecting USB device.");
+      reannounceType = "usb";
+      tud_disconnect();
+      logTimeline("usb_disconnect");
+      reannounceStartTime = now;
+      reannounceState = REANNOUNCE_OFF;
+    }
+  } else if (reannounceState == REANNOUNCE_WAITING && now >= reannounceCheckDelay) {
+    if (!isInMscMode || !card) {
+      reannounceState = REANNOUNCE_DONE;
+      return;
+    }
+    jpegReadsAtCheck = countJpegReads(0);
+    logTimelineValue("picture_check_jpeg_reads", jpegReadsAtCheck);
+    HWSerial.printf("Picture reads after boot: %d (of %u reads, %u JPEG files)\n", jpegReadsAtCheck, mscTotalReads, jpegFiles.size());
     // --- A full log means the host is busy reading, even if the picture reads fell outside it ---
     if (jpegReadsAtCheck > 0 || mscReadLogCount >= MSC_READ_LOG_SIZE) {
       reannounceState = REANNOUNCE_DONE;
@@ -858,11 +910,13 @@ void handleReannounce() {
       HWSerial.println("No reads at all, reconnecting USB device.");
       reannounceType = "usb";
       tud_disconnect();
+      logTimeline("usb_disconnect");
     } else {
       // --- Same as a mode switch seen from the host: the medium disappears and comes back ---
       HWSerial.println("No picture reads, re-announcing USB drive.");
       reannounceType = "medium";
       MSC.end();
+      logTimeline("medium_off");
     }
     reannounceStartTime = now;
     reannounceState = REANNOUNCE_OFF;
@@ -870,13 +924,34 @@ void handleReannounce() {
     reannounceState = REANNOUNCE_DONE;
     if (strcmp(reannounceType, "usb") == 0) {
       tud_connect();
+      logTimeline("usb_connect");
       HWSerial.println("USB device reconnected.");
     } else if (isInMscMode) {
       // --- Skipped if a mode switch during the off time has already taken over the drive ---
       mscInit();
+      logTimeline("medium_on");
       HWSerial.println("USB drive re-announced.");
     }
   }
+}
+
+/**
+ * @brief Adds an event to the boot timeline with the current time.
+ */
+void logTimeline(const char* key) {
+  logTimelineValue(key, millis());
+}
+
+/**
+ * @brief Adds an event with a value to the boot timeline; called from both the loop and USB tasks.
+ */
+void logTimelineValue(const char* key, uint32_t value) {
+  portENTER_CRITICAL(&timelineMux);
+  if (timelineCount < TIMELINE_SIZE) {
+    timeline[timelineCount] = {key, value};
+    timelineCount++;
+  }
+  portEXIT_CRITICAL(&timelineMux);
 }
 
 /**
@@ -1192,8 +1267,9 @@ void enterMscMode() {
 
   // --- Initialize USB MSC ---
   if (card) {
-    USB.onEvent(usbEventCallback);
+    // --- The USB event handler is registered once in setup(); registering it again would double every event ---
     mscInit();
+    logTimeline("mode_msc");
     USBSerial.begin();
     USB.begin();
     HWSerial.println("\n✅ Switched to MSC mode. Connect USB to a computer.");
@@ -1225,6 +1301,7 @@ bool enterFtpMode() {
   
   // --- Stop USB MSC ---
   MSC.end();
+  logTimeline("mode_ftp");
   USBSerial.end();
   HWSerial.println("USB MSC stopped.");
 
@@ -1343,6 +1420,14 @@ void handleMscDebug() {
   }
   jsonResponse["first_read_after_reannounce_ms"] = firstReadAfterReannounceMs;
   jsonResponse["first_jpeg_read_ms"] = firstJpegReadMs;
+
+  // --- Timeline as a list of {key: value} pairs; keys can repeat, e.g. usb_unmounted ---
+  JsonArray timelineJson = jsonResponse.createNestedArray("timeline");
+  int timelineEntries = timelineCount;
+  for (int i = 0; i < timelineEntries; i++) {
+    JsonObject entry = timelineJson.createNestedObject();
+    entry[timeline[i].key] = timeline[i].value;
+  }
 
   String output;
   serializeJson(jsonResponse, output);
