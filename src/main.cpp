@@ -26,6 +26,8 @@
 #include "sdmmc_cmd.h"
 #include "diskio_sdmmc.h"
 #include "tusb.h"
+#include "immich.h"
+#include <functional>
 #include <vector>
 #include <algorithm>
 #include <dirent.h>
@@ -172,6 +174,7 @@ const unsigned long wifiAfterPictureDelay = 2000; // Time after the frame's firs
 const unsigned long wifiStartTimeout = 20000;     // Time after boot to join Wi-Fi even if no picture was read (20 seconds)
 volatile unsigned long firstJpegReadTime = 0;
 bool isNetworkStarted = false;
+volatile bool isImmichSyncRequested = false;
 // --- Re-announce the drive once if the frame has not read any pictures after boot ---
 const unsigned long usbCheckDelay = 10000;        // Time after boot to check that the host has set up USB (10 seconds; a good boot is set up and reading by 6.8 s)
 const unsigned long reannounceCheckDelay = 20000; // Time after boot to check for picture reads (20 seconds; the frame's first picture read was seen at 9.4 s)
@@ -273,6 +276,11 @@ bool isJpegName(const char* name);
 int findJpegRead(uint32_t lba, uint32_t count);
 int countJpegReads(unsigned long fromMs);
 void handleMscDebug();
+void withCardOnDongle(std::function<void()> action);
+void handleImmichSettings();
+void handleImmichSettingsGet();
+void handleImmichSync();
+void handleImmichStatus();
 void logTimeline(const char* key);
 void logTimelineValue(const char* key, uint32_t value);
 void drawHeader(const char* title, uint16_t bannerColor);
@@ -347,6 +355,8 @@ void startNetwork() {
     setupMqtt();
     reconnect(); // Attempt initial MQTT connection
 #endif
+
+    loadImmichSettings();
 
     // --- Update display and MQTT with connected network info ---
     updateDisplayAndMqtt();
@@ -546,9 +556,41 @@ void loop() {
     }
   }
 
+  // --- Sync the Immich album when requested via the API or at the scheduled time ---
+  if (isImmichSyncRequested || isImmichSyncDue()) {
+    isImmichSyncRequested = false;
+    withCardOnDongle([]() {
+#if defined(LCD_ENABLED) && LCD_ENABLED == 1
+      drawInfoScreen("FrameFi", "Syncing Immich...", "", CATPPUCCIN_PEACH);
+#endif
+      syncImmichAlbum();
+    });
+  }
+
   handleMqtt();
   handleFtp();
   handleMsc();
+}
+
+/**
+ * @brief Runs an action with the SD card taken from the USB host, then hands it back.
+ */
+void withCardOnDongle(std::function<void()> action) {
+  bool wasInMscMode = isInMscMode;
+  if (wasInMscMode) {
+    // --- Unplug from the host, so it can't keep a stale copy of the file system or write it back ---
+    tud_disconnect();
+    if (!enterFtpMode()) {
+      tud_connect();
+      return;
+    }
+  }
+  action();
+  if (wasInMscMode) {
+    enterMscMode();
+    // --- Replug: the host has to read the card from scratch ---
+    tud_connect();
+  }
 }
 
 /**
@@ -1254,6 +1296,10 @@ void setupApiRoutes() {
   server.on("/led/brightness", HTTP_POST, handleLedBrightness);
   server.on("/upload", HTTP_POST, handleUpload, handleUploadData);
   server.on("/debug/msc", HTTP_GET, handleMscDebug);
+  server.on("/immich/settings", HTTP_GET, handleImmichSettingsGet);
+  server.on("/immich/settings", HTTP_POST, handleImmichSettings);
+  server.on("/immich/sync", HTTP_POST, handleImmichSync);
+  server.on("/immich/status", HTTP_GET, handleImmichStatus);
 }
 
 void updateDisplayAndMqtt() {
@@ -1324,7 +1370,7 @@ bool enterFtpMode() {
   HWSerial.println("\n--- Entering Application (FTP) Mode ---");
 
 #if defined(LCD_ENABLED) && LCD_ENABLED == 1
-  drawInfoScreen("FrameFi", "Entering FTP Mode...", "", CATPPUCCIN_PEACH);
+  drawInfoScreen("FrameFi", "Updating card...", "", CATPPUCCIN_PEACH);
 #endif
 
   // --- Turn the LED on ---
@@ -1596,6 +1642,65 @@ void sendJsonResponse(const char* status, const char* message) {
   String output;
   serializeJson(jsonResponse, output);
   server.send(200, "application/json", output);
+}
+
+/**
+ * @brief Handles the POST request that changes Immich settings; only the given fields change.
+ */
+void handleImmichSettings() {
+  if (strlen(webServerConfig.user) > 0 && !server.authenticate(webServerConfig.user, webServerConfig.pass)) {
+    return server.requestAuthentication();
+  }
+  String json = server.arg("plain");
+  bool isSaved = false;
+  withCardOnDongle([&]() { isSaved = updateImmichSettings(json); });
+  if (isSaved) {
+    sendJsonResponse("success", "Immich settings saved.");
+  } else {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid JSON object or settings file not writable.\"}");
+  }
+}
+
+/**
+ * @brief Handles the GET request for the Immich settings in effect.
+ */
+void handleImmichSettingsGet() {
+  if (strlen(webServerConfig.user) > 0 && !server.authenticate(webServerConfig.user, webServerConfig.pass)) {
+    return server.requestAuthentication();
+  }
+  server.send(200, "application/json", readImmichSettings());
+}
+
+/**
+ * @brief Handles the POST request that starts an Immich sync; the sync runs from loop().
+ */
+void handleImmichSync() {
+  if (strlen(webServerConfig.user) > 0 && !server.authenticate(webServerConfig.user, webServerConfig.pass)) {
+    return server.requestAuthentication();
+  }
+  // --- Refuse before taking the card from the frame, so a disabled sync never interrupts it ---
+  String problem = checkImmichSettings();
+  if (!problem.isEmpty()) {
+    DynamicJsonDocument jsonResponse(256);
+    jsonResponse["status"] = "error";
+    jsonResponse["message"] = problem;
+    String output;
+    serializeJson(jsonResponse, output);
+    server.send(400, "application/json", output);
+    return;
+  }
+  isImmichSyncRequested = true;
+  sendJsonResponse("success", "Immich sync started; see GET /immich/status.");
+}
+
+/**
+ * @brief Handles the GET request for the last Immich sync result.
+ */
+void handleImmichStatus() {
+  if (strlen(webServerConfig.user) > 0 && !server.authenticate(webServerConfig.user, webServerConfig.pass)) {
+    return server.requestAuthentication();
+  }
+  server.send(200, "application/json", readImmichStatus());
 }
 
 /**
@@ -2308,7 +2413,7 @@ void drawModeScreen(const char* mode, uint16_t headerColor, const char* ip, cons
  * @brief Displays the FTP mode screen.
  */
 void drawFtpModeScreen(const char* ip, const char* mac, int files, int totalSizeMB, float freeSizeMB, bool mqttConnected) {
-  drawModeScreen("FTP", CATPPUCCIN_GREEN, ip, mac, files, totalSizeMB, freeSizeMB, mqttConnected);
+  drawModeScreen("Updating", CATPPUCCIN_GREEN, ip, mac, files, totalSizeMB, freeSizeMB, mqttConnected);
 }
 
 /**
