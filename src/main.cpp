@@ -153,6 +153,11 @@ const long mqttPublishInterval = 300000; // 5 minutes
 // Timer variables for non-blocking reconnection
 unsigned long lastReconnectAttempt = 0;
 const long reconnectInterval = 5000; // Interval to wait between retries (5 seconds)
+// --- Skip SD scans at boot so the USB host can read the card undisturbed ---
+#ifndef STORAGE_SCAN_DELAY_MS
+#define STORAGE_SCAN_DELAY_MS 30000
+#endif
+bool isStorageScanDone = false;
 
 // --- Function prototypes ---
 void initializeConfigs();
@@ -415,6 +420,14 @@ void startInitialMode() {
  * @brief Main loop that runs repeatedly.
  */
 void loop() {
+  // --- Show real storage info once the USB host has had time to read the card ---
+  if (!isStorageScanDone && millis() >= STORAGE_SCAN_DELAY_MS) {
+    isStorageScanDone = true;
+    if (isInMscMode) {
+      updateDisplayAndMqtt();
+    }
+  }
+
   if (WiFi.status() == WL_CONNECTED) {
     server.handleClient();
   }
@@ -593,7 +606,7 @@ void getDeviceInfo(DeviceInfo& info) {
   info.ledBrightness = ::ledBrightness;
 
   if (info.isInMscMode) {
-    if(card) {
+    if (card && millis() >= STORAGE_SCAN_DELAY_MS) {
       info.fileCount = countFilesInPath(MOUNT_POINT);
       FATFS *fs;
       DWORD fre_clust;
