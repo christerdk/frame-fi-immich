@@ -24,6 +24,9 @@
 #include "driver/sdspi_host.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
+#include "diskio_sdmmc.h"
+#include <vector>
+#include <algorithm>
 #include <dirent.h>
 
 // --- Personal header files ---
@@ -158,6 +161,25 @@ const long reconnectInterval = 5000; // Interval to wait between retries (5 seco
 #define STORAGE_SCAN_DELAY_MS 30000
 #endif
 bool isStorageScanDone = false;
+// --- Re-announce the drive once if the frame has not read any pictures after boot ---
+const unsigned long reannounceCheckDelay = 10000; // Time after boot to check for picture reads (10 seconds)
+const unsigned long reannounceOffTime = 3000;     // Time the drive reports no medium during a re-announce (3 seconds)
+enum ReannounceState { REANNOUNCE_WAITING, REANNOUNCE_OFF, REANNOUNCE_DONE };
+ReannounceState reannounceState = REANNOUNCE_WAITING;
+unsigned long reannounceStartTime = 0;
+int jpegReadsAtCheck = -1;
+
+// --- Log of MSC reads, used to tell picture reads from filesystem reads ---
+struct MscRead {
+  uint32_t ms;
+  uint32_t lba;
+  uint32_t count;
+};
+const int MSC_READ_LOG_SIZE = 1024;
+MscRead mscReadLog[MSC_READ_LOG_SIZE];
+volatile int mscReadLogCount = 0;
+volatile uint32_t mscTotalReads = 0;
+std::vector<uint32_t> jpegStartSectors; // First sector of every JPEG file, sorted
 
 // --- Function prototypes ---
 void initializeConfigs();
@@ -206,6 +228,13 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t 
 static int32_t onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize);
 static bool onStartStop(uint8_t power_condition, bool start, bool load_eject);
 static void usbEventCallback(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
+void handleReannounce();
+void buildJpegIndex();
+void addJpegStartSectors(char* path, size_t pathSize, int depth);
+bool isJpegName(const char* name);
+bool isJpegRead(uint32_t lba, uint32_t count);
+int countJpegReads(unsigned long fromMs);
+void handleMscDebug();
 void drawHeader(const char* title, uint16_t bannerColor);
 void drawStorageInfo(int files, int totalSizeMB, float freeSizeMB);
 void drawInfoScreen(const char* title, const char* message, const char* version, uint16_t headerColor);
@@ -427,6 +456,8 @@ void loop() {
       updateDisplayAndMqtt();
     }
   }
+
+  handleReannounce();
 
   if (WiFi.status() == WL_CONNECTED) {
     server.handleClient();
@@ -734,6 +765,13 @@ static int32_t onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufs
   // HWSerial.printf("MSC READ: lba: %u, offset: %u, bufsize: %u\n", lba, offset, bufsize);
   uint32_t count = (bufsize / card->csd.sector_size);
   sdmmc_read_sectors(card, (uint8_t*)buffer + offset, lba, count);
+
+  // --- Log the read so picture reads can be detected ---
+  mscTotalReads++;
+  if (mscReadLogCount < MSC_READ_LOG_SIZE) {
+    mscReadLog[mscReadLogCount] = {millis(), lba, count};
+    mscReadLogCount++;
+  }
   return bufsize;
 }
 
@@ -777,6 +815,114 @@ void mscInit(void) {
   MSC.onWrite(onWrite);
   MSC.mediaPresent(true);
   MSC.begin(card->csd.capacity, card->csd.sector_size);
+}
+
+/**
+ * @brief Re-announces the USB drive once if the frame has not read any pictures after boot.
+ */
+void handleReannounce() {
+  unsigned long now = millis();
+
+  if (reannounceState == REANNOUNCE_WAITING && now >= reannounceCheckDelay) {
+    if (!isInMscMode || !card) {
+      reannounceState = REANNOUNCE_DONE;
+      return;
+    }
+    buildJpegIndex();
+    jpegReadsAtCheck = countJpegReads(0);
+    HWSerial.printf("Picture reads after boot: %d (of %u reads, %u JPEG files)\n", jpegReadsAtCheck, mscTotalReads, jpegStartSectors.size());
+    if (jpegReadsAtCheck > 0) {
+      reannounceState = REANNOUNCE_DONE;
+      return;
+    }
+
+    // --- Same as a mode switch seen from the host: the medium disappears and comes back ---
+    HWSerial.println("No picture reads, re-announcing USB drive.");
+    MSC.end();
+    reannounceStartTime = now;
+    reannounceState = REANNOUNCE_OFF;
+  } else if (reannounceState == REANNOUNCE_OFF && now - reannounceStartTime >= reannounceOffTime) {
+    reannounceState = REANNOUNCE_DONE;
+    // --- A mode switch during the off time has already taken over the drive ---
+    if (isInMscMode) {
+      mscInit();
+      HWSerial.println("USB drive re-announced.");
+    }
+  }
+}
+
+/**
+ * @brief Collects the first sector of every JPEG file on the card.
+ */
+void buildJpegIndex() {
+  char path[300];
+  snprintf(path, sizeof(path), "%u:", ff_diskio_get_pdrv_card(card));
+  jpegStartSectors.clear();
+  addJpegStartSectors(path, sizeof(path), 0);
+  std::sort(jpegStartSectors.begin(), jpegStartSectors.end());
+}
+
+/**
+ * @brief Adds the first sector of each JPEG file in a directory and its subdirectories.
+ */
+void addJpegStartSectors(char* path, size_t pathSize, int depth) {
+  // --- Static to keep the recursion's stack use small; not used across the recursive call ---
+  static FILINFO info;
+  static FIL file;
+  FF_DIR dir;
+
+  if (f_opendir(&dir, path) != FR_OK) return;
+  size_t len = strlen(path);
+
+  while (f_readdir(&dir, &info) == FR_OK && info.fname[0] != 0) {
+    // --- Skip hidden entries such as macOS ._ files ---
+    if (info.fname[0] == '.') continue;
+    snprintf(path + len, pathSize - len, "/%s", info.fname);
+
+    if (info.fattrib & AM_DIR) {
+      if (depth < 4) {
+        addJpegStartSectors(path, pathSize, depth + 1);
+      }
+    } else if (isJpegName(info.fname) && f_open(&file, path, FA_READ) == FR_OK) {
+      if (file.obj.sclust >= 2) {
+        FATFS* fs = file.obj.fs;
+        jpegStartSectors.push_back(fs->database + (file.obj.sclust - 2) * fs->csize);
+      }
+      f_close(&file);
+    }
+    path[len] = '\0';
+  }
+  f_closedir(&dir);
+}
+
+/**
+ * @brief Checks whether a file name ends in .jpg or .jpeg.
+ */
+bool isJpegName(const char* name) {
+  const char* ext = strrchr(name, '.');
+  return ext && (strcasecmp(ext, ".jpg") == 0 || strcasecmp(ext, ".jpeg") == 0);
+}
+
+/**
+ * @brief Checks whether a read covers the first sector of a JPEG file.
+ */
+bool isJpegRead(uint32_t lba, uint32_t count) {
+  auto it = std::lower_bound(jpegStartSectors.begin(), jpegStartSectors.end(), lba);
+  return it != jpegStartSectors.end() && *it < lba + count;
+}
+
+/**
+ * @brief Counts logged reads of JPEG files made at or after the given time.
+ */
+int countJpegReads(unsigned long fromMs) {
+  int jpegReads = 0;
+  int logCount = mscReadLogCount;
+  for (int i = 0; i < logCount; i++) {
+    if (mscReadLog[i].ms >= fromMs && isJpegRead(mscReadLog[i].lba, mscReadLog[i].count)) {
+      jpegReads++;
+    }
+  }
+  return jpegReads;
 }
 
 // --- WiFi ---
@@ -968,6 +1114,7 @@ void setupApiRoutes() {
   server.on("/led/brightness", HTTP_GET, handleLedBrightnessGet);
   server.on("/led/brightness", HTTP_POST, handleLedBrightness);
   server.on("/upload", HTTP_POST, handleUpload, handleUploadData);
+  server.on("/debug/msc", HTTP_GET, handleMscDebug);
 }
 
 void updateDisplayAndMqtt() {
@@ -1105,6 +1252,50 @@ void handleStatus() {
   led["color"] = info.ledColor;
   led["state"] = (leds[0] == CRGB::Black) ? "off" : "on";
   led["brightness"] = info.ledBrightness;
+
+  String output;
+  serializeJson(jsonResponse, output);
+  server.send(200, "application/json", output);
+}
+
+/**
+ * @brief Handles the GET request for MSC read statistics since boot.
+ */
+void handleMscDebug() {
+  if (strlen(webServerConfig.user) > 0 && !server.authenticate(webServerConfig.user, webServerConfig.pass)) {
+    return server.requestAuthentication();
+  }
+  const int MAX_LISTED_READS = 40;
+  int logCount = mscReadLogCount;
+  int listed = min(logCount, MAX_LISTED_READS);
+
+  DynamicJsonDocument jsonResponse(JSON_OBJECT_SIZE(12) + JSON_ARRAY_SIZE(MAX_LISTED_READS) + MAX_LISTED_READS * JSON_OBJECT_SIZE(4) + 256);
+  jsonResponse["uptime_ms"] = millis();
+  jsonResponse["total_reads"] = mscTotalReads;
+  jsonResponse["logged_reads"] = logCount;
+  jsonResponse["jpeg_files"] = jpegStartSectors.size();
+  jsonResponse["jpeg_reads_at_check"] = jpegReadsAtCheck;
+  jsonResponse["jpeg_reads_total"] = countJpegReads(0);
+  jsonResponse["reannounced"] = reannounceStartTime > 0;
+  jsonResponse["reannounce_ms"] = reannounceStartTime;
+  jsonResponse["jpeg_reads_after_reannounce"] = reannounceStartTime > 0 ? countJpegReads(reannounceStartTime) : 0;
+  jsonResponse["first_read_ms"] = logCount > 0 ? mscReadLog[0].ms : 0;
+  long firstJpegReadMs = -1;
+  for (int i = 0; i < logCount; i++) {
+    if (isJpegRead(mscReadLog[i].lba, mscReadLog[i].count)) {
+      firstJpegReadMs = mscReadLog[i].ms;
+      break;
+    }
+  }
+  jsonResponse["first_jpeg_read_ms"] = firstJpegReadMs;
+  JsonArray reads = jsonResponse.createNestedArray("reads");
+  for (int i = 0; i < listed; i++) {
+    JsonObject read = reads.createNestedObject();
+    read["ms"] = mscReadLog[i].ms;
+    read["lba"] = mscReadLog[i].lba;
+    read["count"] = mscReadLog[i].count;
+    read["jpeg"] = isJpegRead(mscReadLog[i].lba, mscReadLog[i].count);
+  }
 
   String output;
   serializeJson(jsonResponse, output);
