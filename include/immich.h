@@ -38,3 +38,8 @@ void syncImmichAlbum();
  * @brief Returns the content of /immich/status.json, or an empty JSON object.
  */
 String readImmichStatus();
+
+/**
+ * @brief Formats the local time, or returns "clock not set" before NTP has set it; the time zone comes from the Immich settings.
+ */
+String localTimeString();

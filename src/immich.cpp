@@ -68,10 +68,7 @@ static bool writeJsonFile(const char* path, const JsonDocument& doc) {
   return isWritten;
 }
 
-/**
- * @brief Formats the local time for status.json.
- */
-static String localTimeString() {
+String localTimeString() {
   time_t now = time(nullptr);
   if (now < CLOCK_SET_AFTER) return "clock not set";
   struct tm local;

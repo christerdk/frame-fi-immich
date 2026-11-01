@@ -1422,8 +1422,12 @@ void handleStatus() {
   DeviceInfo info;
   getDeviceInfo(info);
 
-  const int JSON_STATUS_SIZE = JSON_OBJECT_SIZE(5) + JSON_OBJECT_SIZE(2) + JSON_OBJECT_SIZE(4) + JSON_OBJECT_SIZE(3) + JSON_OBJECT_SIZE(3);
-  DynamicJsonDocument jsonResponse(JSON_STATUS_SIZE);
+  // --- "{}" means there is no status.json yet, i.e. no Immich sync has run ---
+  String immichStatus = readImmichStatus();
+  bool hasImmichStatus = immichStatus != "{}";
+
+  const int JSON_STATUS_SIZE = JSON_OBJECT_SIZE(8) + JSON_OBJECT_SIZE(2) + JSON_OBJECT_SIZE(4) + JSON_OBJECT_SIZE(3) + JSON_OBJECT_SIZE(3) + JSON_OBJECT_SIZE(1) + JSON_OBJECT_SIZE(5) + 32;
+  DynamicJsonDocument jsonResponse(JSON_STATUS_SIZE + immichStatus.length() + 1);
   jsonResponse["mode"] = info.modeString;
   JsonObject display = jsonResponse.createNestedObject("display");
   display["status"] = info.displayStatus;
@@ -1441,6 +1445,17 @@ void handleStatus() {
   led["color"] = info.ledColor;
   led["state"] = (leds[0] == CRGB::Black) ? "off" : "on";
   led["brightness"] = info.ledBrightness;
+  JsonObject system = jsonResponse.createNestedObject("system");
+  system["firmware"] = APP_VERSION;
+  system["uptime_s"] = millis() / 1000;
+  system["time"] = localTimeString();
+  system["free_heap"] = ESP.getFreeHeap();
+  system["min_free_heap"] = ESP.getMinFreeHeap();
+  JsonObject wifi = jsonResponse.createNestedObject("wifi");
+  wifi["rssi"] = WiFi.RSSI();
+  if (hasImmichStatus) {
+    jsonResponse["immich"] = serialized(immichStatus);
+  }
 
   String output;
   serializeJson(jsonResponse, output);
