@@ -28,6 +28,7 @@
 #include "tusb.h"
 #include "immich.h"
 #include <functional>
+#include <sys/stat.h>
 #include <vector>
 #include <algorithm>
 #include <dirent.h>
@@ -279,6 +280,7 @@ void handleMscDebug();
 void withCardOnDongle(std::function<void()> action);
 void handleImmichSettings();
 void handleImmichSettingsGet();
+void handleFiles();
 void handleImmichSync();
 void handleImmichStatus();
 void logTimeline(const char* key);
@@ -1300,6 +1302,7 @@ void setupApiRoutes() {
   server.on("/immich/settings", HTTP_POST, handleImmichSettings);
   server.on("/immich/sync", HTTP_POST, handleImmichSync);
   server.on("/immich/status", HTTP_GET, handleImmichStatus);
+  server.on("/files", HTTP_GET, handleFiles);
 }
 
 void updateDisplayAndMqtt() {
@@ -1674,6 +1677,43 @@ void handleImmichSettings() {
   } else {
     server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid JSON object or settings file not writable.\"}");
   }
+}
+
+/**
+ * @brief Handles the GET request that lists one folder on the card in on-card order; it only reads, so the host keeps the card.
+ */
+void handleFiles() {
+  if (strlen(webServerConfig.user) > 0 && !server.authenticate(webServerConfig.user, webServerConfig.pass)) {
+    return server.requestAuthentication();
+  }
+  String path = server.hasArg("path") ? server.arg("path") : "/";
+  String folderPath = String(MOUNT_POINT) + (path == "/" ? "" : path);
+  DIR* folder = opendir(folderPath.c_str());
+  if (!folder) {
+    server.send(404, "application/json", "{\"status\":\"error\",\"message\":\"Folder not found.\"}");
+    return;
+  }
+
+  DynamicJsonDocument jsonResponse(24576);
+  jsonResponse["path"] = path;
+  JsonArray entries = jsonResponse.createNestedArray("entries");
+  for (struct dirent* entry = readdir(folder); entry; entry = readdir(folder)) {
+    JsonObject item = entries.createNestedObject();
+    item["name"] = entry->d_name;
+    item["dir"] = entry->d_type == DT_DIR;
+    struct stat info;
+    if (stat((folderPath + "/" + entry->d_name).c_str(), &info) == 0) {
+      item["size"] = info.st_size;
+      char modified[20];
+      strftime(modified, sizeof(modified), "%Y-%m-%d %H:%M:%S", localtime(&info.st_mtime));
+      item["modified"] = modified;
+    }
+  }
+  closedir(folder);
+
+  String output;
+  serializeJson(jsonResponse, output);
+  server.send(200, "application/json", output);
 }
 
 /**
